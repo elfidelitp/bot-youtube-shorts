@@ -1,0 +1,10 @@
+# Secretos — NUNCA se suben al repo (vían cifrados como Secretos de GitHub)
+client_secret.json
+token.pickle
+
+# Trabajo local del PC (no persistente)
+temp/
+errores/
+__pycache__/
+*.pyc
+iniciar_bot.bat
