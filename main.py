@@ -38,6 +38,7 @@ import re
 import shutil
 import socket
 import sys
+import threading
 import textwrap
 import time
 import wave
@@ -59,6 +60,11 @@ CARPETA_COLA = BASE / "cola_videos"             # listos para subir
 CARPETA_SUBIDOS = BASE / "subidos"              # ya publicados
 CARPETA_ERRORES = BASE / "errores"              # fallidos definitivos
 CARPETA_TEMP = BASE / "temp"                    # archivos de trabajo
+
+# --- Discord (opcional): latidos y avisos vía webhook ---
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+INTERVALO_HEARTBEAT_SEG = 300                   # latido a Discord cada 5 minutos
+INICIO_RUN = time.time()
 
 VIDEOS_POR_LOTE = 5          # videos generados en cada fase de producción
 PAUSA_MIN_H = 4.0            # pausa mínima tras subir (horas)
@@ -108,6 +114,118 @@ def configurar_logging() -> None:
         ch.setLevel(logging.INFO)
         ch.setFormatter(fmt)
         log.addHandler(ch)
+    log.addHandler(_CapturaUltimoLog(level=logging.INFO))
+
+
+# ------------------------------------------------------------------ #
+# 2.5 NOTIFICACIONES A DISCORD (se activan con DISCORD_WEBHOOK_URL)
+# ------------------------------------------------------------------ #
+_ultimo_mensaje_log = {"texto": "(sin eventos aún)"}
+
+
+class _CapturaUltimoLog(logging.Handler):
+    """Guarda el último mensaje del log para incluirlo en el latido."""
+
+    def emit(self, record):
+        try:
+            _ultimo_mensaje_log["texto"] = record.getMessage()
+        except Exception:
+            pass
+
+
+def discord_log(mensaje: str | None = None, embed: dict | None = None) -> None:
+    """Envía mensaje y/o embed al webhook de Discord; si falla, no rompe el bot."""
+    if not DISCORD_WEBHOOK or (not mensaje and not embed):
+        return
+    try:
+        import urllib.request
+
+        payload: dict = {"username": "Bot YouTube 24/7"}
+        if mensaje:
+            payload["content"] = mensaje[:1900]
+        if embed:
+            payload["embeds"] = [embed]
+        datos = json.dumps(payload).encode("utf-8")
+        peticion = urllib.request.Request(
+            DISCORD_WEBHOOK,
+            data=datos,
+            headers={"Content-Type": "application/json"},
+        )
+        urllib.request.urlopen(peticion, timeout=15)
+    except Exception as error:
+        log.debug(f"📡 Discord no respondió: {error}")
+
+
+# Colores de los embeds (entero hexadecimal de Discord)
+COLOR_PUBLICADO = 0x2ECC71   # verde
+COLOR_LISTO = 0x3498DB       # azul
+COLOR_ERROR = 0xE74C3C       # rojo
+COLOR_AVISO = 0xF39C12       # naranja
+
+
+def discord_embed_video(evento: str, color: int, ruta: Path | None = None,
+                        video_id: str | None = None, meta: dict | None = None,
+                        historia: dict | None = None, extra: str = "") -> None:
+    """Embed detallado de Discord con todos los datos de un video."""
+    campos: list[dict] = []
+    if meta:
+        campos.append({"name": "🎬 Título", "value": (meta.get("titulo") or "?")[:250],
+                       "inline": False})
+        campos.append({"name": "📝 Descripción",
+                       "value": (meta.get("descripcion") or "(vacía)")[:1000],
+                       "inline": False})
+        etiquetas = ", ".join(meta.get("tags", []))
+        if etiquetas:
+            campos.append({"name": "🏷️ Etiquetas", "value": etiquetas[:1000],
+                           "inline": False})
+    elif historia:
+        campos.append({"name": "🎬 Título", "value": (historia.get("titulo") or "?")[:250],
+                       "inline": False})
+        campos.append({"name": "🏘️ Pueblo", "value": historia.get("pueblo", "?"),
+                       "inline": True})
+        campos.append({"name": "👤 Entidad", "value": historia.get("entidad", "?"),
+                       "inline": True})
+        campos.append({"name": "⏰ Hora clave", "value": historia.get("hora", "?"),
+                       "inline": True})
+    if ruta is not None:
+        try:
+            peso = ruta.stat().st_size / (1024 * 1024)
+            campos.append({"name": "💾 Peso", "value": f"{peso:.1f} MB", "inline": True})
+            campos.append({"name": "📁 Archivo", "value": f"`{ruta.name}`", "inline": True})
+        except OSError:
+            pass
+    if video_id:
+        campos.append({"name": "🔗 Enlace",
+                       "value": f"https://youtube.com/shorts/{video_id}", "inline": False})
+    if extra:
+        campos.append({"name": "ℹ️ Detalle", "value": extra[:1000], "inline": False})
+
+    embed = {
+        "title": evento[:256],
+        "color": color,
+        "fields": campos[:25],
+        "footer": {"text": "Bot YouTube Shorts 24/7"},
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    discord_log(embed=embed)
+
+
+def _hilo_heartbeat() -> None:
+    """Latido a Discord cada 5 minutos con el estado actual del bot."""
+    while True:
+        time.sleep(INTERVALO_HEARTBEAT_SEG)
+        try:
+            en_cola = len(videos_en_cola())
+            restante = pausa_pendiente()
+            proxima = formato_duracion(restante) if restante > 0 else "listo para subir"
+            corrida = formato_duracion(time.time() - INICIO_RUN)
+            discord_log(
+                f"💓 **Bot vivo** · en ejecución: {corrida}\n"
+                f"📥 Cola: **{en_cola}** video(s) · próx. subida: **{proxima}**\n"
+                f"📝 Último evento: {_ultimo_mensaje_log['texto']}"
+            )
+        except Exception:
+            pass
 
 
 # ------------------------------------------------------------------ #
@@ -619,11 +737,18 @@ def generar_lote(cantidad: int) -> int:
             guardar_estado(estado)
             log.info(f"✅ [{i}/{cantidad}] {nombre} listo en cola "
                      f"({formato_duracion(time.time() - t0)} de producción)")
+            discord_embed_video(
+                f"🏭 Video {i}/{cantidad} listo en la cola",
+                COLOR_LISTO, ruta=destino, historia=historia,
+                extra=f"Producción: {formato_duracion(time.time() - t0)}",
+            )
             limpiar_temp()
         except Exception as error:
             log.error(f"❌ [{i}/{cantidad}] Fallo generando el video: {error}")
             log.debug("", exc_info=True)
     log.info(f"🏭 Lote terminado: {hechos}/{cantidad} videos en /cola_videos")
+    discord_log(f"🏭 **Lote de producción terminado**: {hechos}/{cantidad} videos "
+                f"listos en la cola.")
     return hechos
 
 
@@ -879,6 +1004,11 @@ def bucle_principal(ciclo: bool = False, sin_navegador: bool = False) -> None:
             log.info(f"🚀 PUBLICADO: https://youtube.com/shorts/{video_id} "
                      f"({formato_duracion(time.time() - t0)} de subida) | "
                      f"Título: {meta['titulo']!r}")
+            discord_embed_video(
+                "🚀 ¡Video publicado en YouTube!",
+                COLOR_PUBLICADO, ruta=video, video_id=video_id, meta=meta,
+                extra=f"Subida: {formato_duracion(time.time() - t0)}",
+            )
             archivar(video, CARPETA_SUBIDOS)
 
             if ciclo:
@@ -892,12 +1022,14 @@ def bucle_principal(ciclo: bool = False, sin_navegador: bool = False) -> None:
             break
         except CuotaDiaria as error:
             log.warning(f"🚦 Cuota/rate-limit de YouTube ({error}); se reintentará más tarde.")
+            discord_log(f"🚦 Cuota de YouTube agotada ({error}); se reintentará en la próxima corrida.")
             if ciclo:
                 return
             dormir(3600, "esperando cuota de la API")
         except VideoInvalido as error:
             if video:
                 log.error(f"🗑️ Video rechazado por la API ({error}); a /errores: {video.name}")
+                discord_log(f"🗑️ Video rechazado por YouTube ({error}): {video.name}")
                 try:
                     archivar(video, CARPETA_ERRORES)
                 except Exception:
@@ -909,6 +1041,7 @@ def bucle_principal(ciclo: bool = False, sin_navegador: bool = False) -> None:
             # Fallo de red/API/genérico: log + 10 min + reintento sin crashear.
             log.error(f"❌ ERROR inesperado: {error}")
             log.debug("", exc_info=True)
+            discord_log(f"❌ **ERROR del bot**: {error}\nSe reintentará automáticamente.")
             if video and registrar_intento_fallido(video) >= MAX_INTENTOS:
                 log.error(f"🗑️ {video.name} agotó sus {MAX_INTENTOS} intentos; a /errores.")
                 try:
@@ -932,6 +1065,10 @@ def main() -> None:
     configurar_logging()
     crear_carpetas()
 
+    if DISCORD_WEBHOOK:
+        threading.Thread(target=_hilo_heartbeat, daemon=True).start()
+        log.info("📡 Latidos de Discord activos (cada 5 minutos).")
+
     parser = argparse.ArgumentParser(description="Bot autónomo de YouTube Shorts 24/7")
     parser.add_argument("--autorizar", action="store_true",
                         help="solo realiza el OAuth y guarda token.pickle")
@@ -953,6 +1090,8 @@ def main() -> None:
              f"Video: {ANCHO}x{ALTO} @{FPS}fps")
     log.info(f"   Log: {ARCHIVO_LOG.name} | Voz: {VOZ} | Whisper: {MODELO_WHISPER}")
     log.info("=" * 64)
+    discord_log(f"🟢 **Bot iniciado** ({'ciclo CI' if args.ciclo else 'modo 24/7 local'}) · "
+                f"lote {args.lote} · pausa {PAUSA_MIN_H}-{PAUSA_MAX_H} h")
 
     if not ARCHIVO_SECRETS.exists():
         log.error("🚨 Falta client_secret.json junto a main.py. Descárgalo de "

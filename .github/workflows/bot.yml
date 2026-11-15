@@ -48,6 +48,8 @@ jobs:
           key: whisper-faster-small
 
       - name: Ejecutar un ciclo del bot
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
         run: python main.py --ciclo --sin-navegador
 
       - name: Guardar cola, estado y log en el repositorio
